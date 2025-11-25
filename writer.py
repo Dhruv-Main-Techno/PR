@@ -10,7 +10,6 @@ import httpx
 import json
 import requests
 
-
 load_dotenv()
 
 templates = Jinja2Templates(directory="templates")
@@ -23,11 +22,9 @@ SESSION_ID = os.getenv("SESSION_ID")
 app = FastAPI()
 
 listener_client = None
-listener_queue = None  # will initialize in main()
+listener_queue = None
 
-
-# -------------------- Helper functions --------------------
-
+ 
 async def forward_to_lyzr(message: str) -> str:
     payload = {
         "user_id": USER_ID,
@@ -42,7 +39,6 @@ async def forward_to_lyzr(message: str) -> str:
         response.raise_for_status()
         data = response.json()
         return data.get("response", "No response from LyZR")
-
 
 def get_all_pull_requests(owner, repo, state="open", token=None):
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
@@ -59,7 +55,6 @@ def get_all_pull_requests(owner, repo, state="open", token=None):
         all_prs.extend(prs)
         page += 1
     return all_prs
-
 
 async def process_prs_and_forward(listener_ws, prs):
     async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -87,80 +82,7 @@ async def process_prs_and_forward(listener_ws, prs):
                         global listener_client
                         listener_client = None
 
-async def ws_process_request(path, request_headers):
-    # method header is not standard in WebSocket handshake.
-    # So browsers won't send it. Fall back to normal behavior.
-    method = request_headers.get("Method")
-    if method:
-        method = method.upper()
-    else:
-        method = "GET"  # assume GET for WebSocket upgrade requests
-
-    # Allow GET (normal WebSocket), reject anything else
-    if method != "GET":
-        # Handle browser preflights safely
-        if method in ["HEAD", "OPTIONS"]:
-            return (
-                200,
-                [
-                    ("Access-Control-Allow-Origin", "*"),
-                    ("Access-Control-Allow-Headers", "*"),
-                    ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
-                ],
-                b""
-            )
-        return (
-            405,
-            [("Content-Type", "text/plain")],
-            b"Method Not Allowed"
-        )
-
-    # Validate WebSocket upgrade headers
-    connection_hdr = request_headers.get("Connection", "") or ""
-    upgrade_hdr = request_headers.get("Upgrade", "") or ""
-
-    if "upgrade" not in connection_hdr.lower():
-        return (
-            426,
-            [("Content-Type", "text/plain")],
-            b"Upgrade Required"
-        )
-
-    if upgrade_hdr.lower() != "websocket":
-        return (
-            400,
-            [("Content-Type", "text/plain")],
-            b"Bad Request: Expected WebSocket upgrade"
-        )
-
-    # Allow all origins
-    origin = request_headers.get("Origin")
-    if origin:
-        return None  # proceed with the WebSocket handshake normally
-
-    return None
-
-    
-    if method and method.upper() != "GET":
-        return (
-            405,
-            [("Content-Type", "text/plain")],
-            b"Method Not Allowed",
-        )
-    
-    # Also block non-WebSocket upgrade attempts
-    if "upgrade" not in request_headers.get("Connection", "").lower():
-        return (
-            426,
-            [("Content-Type", "text/plain")],
-            b"Upgrade Required",
-        )
-    
-    return None  # Continue with WebSocket handshake
-
-
-# -------------------- WebSocket listener --------------------
-
+ 
 async def listener_sender():
     global listener_client
     while True:
@@ -170,7 +92,6 @@ async def listener_sender():
                 await listener_client.send(message)
             except websockets.ConnectionClosed:
                 listener_client = None
-
 
 async def ws_handler(websocket):
     global listener_client
@@ -192,20 +113,15 @@ async def ws_handler(websocket):
         if websocket == listener_client:
             listener_client = None
 
-
 async def start_ws_server():
     server = await websockets.serve(
         ws_handler,
         "0.0.0.0",
-        8765,
-        process_request=ws_process_request
+        8765
     )
     await server.wait_closed()
 
-
-
-# -------------------- FastAPI webhook --------------------
-
+ 
 @app.post("/webhook")
 async def webhook(request: Request):
     body = await request.json()
@@ -230,7 +146,6 @@ async def webhook(request: Request):
         }
         lyzr_response = await forward_to_lyzr(patch_content)
         combined_response = {"pull_request": pr_info, "lyzr_response": lyzr_response}
-        # thread-safe put into queue
         listener_queue.put_nowait(str(combined_response))
         return {"status": "sent", "message": combined_response}
     return {"status": "error", "message": "WebSocket listener not ready"}
@@ -239,26 +154,23 @@ async def webhook(request: Request):
 async def get_home(request: Request):
     return templates.TemplateResponse("listener.html", {"request": request})
 
-# -------------------- Main startup --------------------
+ 
 @app.head("/")
 async def head_root():
     return Response(status_code=200)
 
 async def main():
     global listener_queue
-    listener_queue = asyncio.Queue()  # create queue in this loop
+    listener_queue = asyncio.Queue()
 
     config = uvicorn.Config(app, host="0.0.0.0", port=8000, loop="asyncio", lifespan="on")
     server = uvicorn.Server(config)
 
-    # Run FastAPI + WebSocket + listener_sender concurrently
     await asyncio.gather(
         start_ws_server(),
         listener_sender(),
         server.serve()
     )
 
-
 if __name__ == "__main__":
     asyncio.run(main())
-
