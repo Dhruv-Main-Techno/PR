@@ -1,20 +1,18 @@
 import asyncio
 import websockets
 from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 import uvicorn
-import threading
-import httpx
 import os
 from dotenv import load_dotenv
+import httpx
 import json
 import requests
 
-listener_client = None
-listener_queue = asyncio.Queue()
-ws_loop = None  
-
 load_dotenv()
 
+templates = Jinja2Templates(directory="templates")
 LYZR_API_URL = os.getenv("LYZR_API_URL", "https://agent-prod.studio.lyzr.ai/v3/inference/chat/")
 LYZR_API_KEY = os.getenv("LYZR_API_KEY")
 USER_ID = os.getenv("USER_ID")
@@ -23,6 +21,12 @@ SESSION_ID = os.getenv("SESSION_ID")
 
 app = FastAPI()
 
+listener_client = None
+listener_queue = None  # will initialize in main()
+
+
+# -------------------- Helper functions --------------------
+
 async def forward_to_lyzr(message: str) -> str:
     payload = {
         "user_id": USER_ID,
@@ -30,10 +34,7 @@ async def forward_to_lyzr(message: str) -> str:
         "session_id": SESSION_ID,
         "message": message
     }
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": LYZR_API_KEY
-    }
+    headers = {"Content-Type": "application/json", "x-api-key": LYZR_API_KEY}
     timeout = httpx.Timeout(30.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         response = await client.post(LYZR_API_URL, json=payload, headers=headers)
@@ -41,11 +42,10 @@ async def forward_to_lyzr(message: str) -> str:
         data = response.json()
         return data.get("response", "No response from LyZR")
 
+
 def get_all_pull_requests(owner, repo, state="open", token=None):
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
-    headers = {}
-    if token:
-        headers["Authorization"] = f"token {token}"
+    headers = {"Authorization": f"token {token}"} if token else {}
     all_prs = []
     page = 1
     while True:
@@ -58,6 +58,7 @@ def get_all_pull_requests(owner, repo, state="open", token=None):
         all_prs.extend(prs)
         page += 1
     return all_prs
+
 
 async def process_prs_and_forward(listener_ws, prs):
     async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -77,15 +78,16 @@ async def process_prs_and_forward(listener_ws, prs):
                 }
                 await listener_ws.send(json.dumps(payload))
             except Exception as e:
-                error_payload = {
-                    "pr_number": pr['number'],
-                    "error": str(e)
-                }
+                error_payload = {"pr_number": pr['number'], "error": str(e)}
                 if listener_ws:
                     try:
                         await listener_ws.send(json.dumps(error_payload))
                     except websockets.ConnectionClosed:
+                        global listener_client
                         listener_client = None
+
+
+# -------------------- WebSocket listener --------------------
 
 async def listener_sender():
     global listener_client
@@ -96,6 +98,7 @@ async def listener_sender():
                 await listener_client.send(message)
             except websockets.ConnectionClosed:
                 listener_client = None
+
 
 async def ws_handler(websocket):
     global listener_client
@@ -117,6 +120,14 @@ async def ws_handler(websocket):
         if websocket == listener_client:
             listener_client = None
 
+
+async def start_ws_server():
+    server = await websockets.serve(ws_handler, "localhost", 8765)
+    await server.wait_closed()
+
+
+# -------------------- FastAPI webhook --------------------
+
 @app.post("/webhook")
 async def webhook(request: Request):
     body = await request.json()
@@ -129,38 +140,43 @@ async def webhook(request: Request):
             response = await client.get(patch_url)
             response.raise_for_status()
             patch_content = response.text
-        except httpx.RequestError as e:
-            return {"status": "error", "message": f"Failed to fetch patch_url: {str(e)}"}
-        except httpx.HTTPStatusError as e:
-            return {"status": "error", "message": f"HTTP error fetching patch_url: {str(e)}"}
-    if ws_loop:
-        pr = pull_requests
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+    if listener_queue:
         pr_info = {
-            "user_login": pr["user"]["login"],
-            "user_id": pr["user"]["id"],
-            "title": pr["title"],
+            "user_login": pull_requests["user"]["login"],
+            "user_id": pull_requests["user"]["id"],
+            "title": pull_requests["title"],
             "number": body["number"],
             "action": body["action"]
         }
         lyzr_response = await forward_to_lyzr(patch_content)
-        combined_response = {
-            "pull_request": pr_info,
-            "lyzr_response": lyzr_response
-        }
-        ws_loop.call_soon_threadsafe(listener_queue.put_nowait, str(combined_response))
+        combined_response = {"pull_request": pr_info, "lyzr_response": lyzr_response}
+        # thread-safe put into queue
+        listener_queue.put_nowait(str(combined_response))
         return {"status": "sent", "message": combined_response}
-    return {"status": "error", "message": "WebSocket loop not ready"}
+    return {"status": "error", "message": "WebSocket listener not ready"}
+
+@app.get("/", response_class=HTMLResponse)
+async def get_home(request: Request):
+    return templates.TemplateResponse("listener.html", {"request": request})
+
+# -------------------- Main startup --------------------
 
 async def main():
-    global ws_loop
-    ws_loop = asyncio.get_running_loop()
-    server = await websockets.serve(ws_handler, "localhost", 8765)
-    asyncio.create_task(listener_sender())
-    await server.wait_closed()
+    global listener_queue
+    listener_queue = asyncio.Queue()  # create queue in this loop
 
-def start_api():
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    config = uvicorn.Config(app, host="0.0.0.0", port=8000, loop="asyncio", lifespan="on")
+    server = uvicorn.Server(config)
+
+    # Run FastAPI + WebSocket + listener_sender concurrently
+    await asyncio.gather(
+        start_ws_server(),
+        listener_sender(),
+        server.serve()
+    )
+
 
 if __name__ == "__main__":
-    threading.Thread(target=start_api, daemon=True).start()
     asyncio.run(main())
