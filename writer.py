@@ -1,6 +1,6 @@
 import asyncio
 import websockets
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 import uvicorn
@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import httpx
 import json
 import requests
+
 
 load_dotenv()
 
@@ -162,6 +163,9 @@ async def get_home(request: Request):
     return templates.TemplateResponse("listener.html", {"request": request})
 
 # -------------------- Main startup --------------------
+@app.head("/")
+async def head_root():
+    return Response(status_code=200)
 
 async def main():
     global listener_queue
