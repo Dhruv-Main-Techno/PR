@@ -1,6 +1,6 @@
-fastapi==0.109.2
-uvicorn[standard]==0.23.2
-websockets==11.0.3
-httpx==0.26.1
-requests==2.32.1
-python-dotenv==1.0.1
+fastapi
+uvicorn
+websockets
+httpx
+requests
+python-dotenv
