@@ -4,3 +4,4 @@ websockets
 httpx
 requests
 python-dotenv
+jinja2
