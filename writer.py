@@ -13,37 +13,36 @@ import requests
 load_dotenv()
 
 templates = Jinja2Templates(directory="templates")
-LYZR_API_URL = os.getenv("LYZR_API_URL", "https://agent-prod.studio.lyzr.ai/v3/inference/chat/")
-LYZR_API_KEY = os.getenv("LYZR_API_KEY")
-USER_ID = os.getenv("USER_ID")
-AGENT_ID = os.getenv("AGENT_ID")
-SESSION_ID = os.getenv("SESSION_ID")
+API_URL = os.getenv("LYZR_API_URL", "https://agent-prod.studio.lyzr.ai/v3/inference/chat/")
+API_KEY = os.getenv("LYZR_API_KEY")
+UID = os.getenv("USER_ID")
+AID = os.getenv("AGENT_ID")
+SID = os.getenv("SESSION_ID")
 
 app = FastAPI()
 
-listener_client = None
-listener_queue = None
+ws_client = None
+msg_queue = None
 
- 
-async def forward_to_lyzr(message: str) -> str:
+async def send_to_api(msg: str) -> str:
     payload = {
-        "user_id": USER_ID,
-        "agent_id": AGENT_ID,
-        "session_id": SESSION_ID,
-        "message": message
+        "user_id": UID,
+        "agent_id": AID,
+        "session_id": SID,
+        "message": msg
     }
-    headers = {"Content-Type": "application/json", "x-api-key": LYZR_API_KEY}
+    headers = {"Content-Type": "application/json", "x-api-key": API_KEY}
     timeout = httpx.Timeout(30.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        response = await client.post(LYZR_API_URL, json=payload, headers=headers)
+        response = await client.post(API_URL, json=payload, headers=headers)
         response.raise_for_status()
         data = response.json()
-        return data.get("response", "No response from LyZR")
+        return data.get("response", "No response from API")
 
-def get_all_pull_requests(owner, repo, state="open", token=None):
+def get_prs(owner, repo, state="open", token=None):
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
     headers = {"Authorization": f"token {token}"} if token else {}
-    all_prs = []
+    all_items = []
     page = 1
     while True:
         params = {"state": state, "per_page": 100, "page": page}
@@ -52,125 +51,118 @@ def get_all_pull_requests(owner, repo, state="open", token=None):
         prs = response.json()
         if not prs:
             break
-        all_prs.extend(prs)
+        all_items.extend(prs)
         page += 1
-    return all_prs
+    return all_items
 
-async def process_prs_and_forward(listener_ws, prs):
+async def process_prs(ws, prs):
     async with httpx.AsyncClient(follow_redirects=True) as client:
         for pr in prs:
             try:
-                patch_url = pr.get("patch_url")
-                if not patch_url:
+                p_url = pr.get("patch_url")
+                if not p_url:
                     raise ValueError("PR has no patch_url")
-                patch_response = await client.get(patch_url)
-                patch_response.raise_for_status()
-                patch_content = patch_response.text
-                response_text = await forward_to_lyzr(patch_content)
+                p_res = await client.get(p_url)
+                p_res.raise_for_status()
+                p_text = p_res.text
+                r_text = await send_to_api(p_text)
                 payload = {
                     "pr_number": pr['number'],
                     "pr_title": pr['title'],
-                    "lyzr_response": response_text
+                    "response": r_text
                 }
-                await listener_ws.send(json.dumps(payload))
+                await ws.send(json.dumps(payload))
             except Exception as e:
-                error_payload = {"pr_number": pr['number'], "error": str(e)}
-                if listener_ws:
+                err = {"pr_number": pr['number'], "error": str(e)}
+                if ws:
                     try:
-                        await listener_ws.send(json.dumps(error_payload))
+                        await ws.send(json.dumps(err))
                     except websockets.ConnectionClosed:
-                        global listener_client
-                        listener_client = None
+                        global ws_client
+                        ws_client = None
 
- 
-async def listener_sender():
-    global listener_client
+async def sender():
+    global ws_client
     while True:
-        message = await listener_queue.get()
-        if listener_client:
+        msg = await msg_queue.get()
+        if ws_client:
             try:
-                await listener_client.send(message)
+                await ws_client.send(msg)
             except websockets.ConnectionClosed:
-                listener_client = None
+                ws_client = None
 
-async def ws_handler(websocket):
-    global listener_client
+async def handle_ws(ws):
+    global ws_client
     try:
-        async for message in websocket:
-            if message == "__register_streamlit__":
-                listener_client = websocket
+        async for msg in ws:
+            if msg == "__register_streamlit__":
+                ws_client = ws
                 try:
-                    pr_data = get_all_pull_requests(owner="DhruvVayugundla", repo="testing")
-                    asyncio.create_task(process_prs_and_forward(listener_client, pr_data))
+                    prs = get_prs(owner="DhruvVayugundla", repo="testing")
+                    asyncio.create_task(process_prs(ws_client, prs))
                 except Exception as e:
-                    await listener_client.send(json.dumps({"error": str(e)}))
+                    await ws_client.send(json.dumps({"error": str(e)}))
                 continue
-            if websocket == listener_client:
-                print(f"Reply from listener: {message}")
+            if ws == ws_client:
+                print(f"Reply: {msg}")
             else:
-                await listener_queue.put(message)
+                await msg_queue.put(msg)
     except websockets.ConnectionClosed:
-        if websocket == listener_client:
-            listener_client = None
+        if ws == ws_client:
+            ws_client = None
 
-async def start_ws_server():
-    server = await websockets.serve(
-        ws_handler,
-        "0.0.0.0",
-        8765
-    )
+async def start_ws():
+    server = await websockets.serve(handle_ws, "0.0.0.0", 8765)
     await server.wait_closed()
 
- 
 @app.post("/webhook")
-async def webhook(request: Request):
-    body = await request.json()
-    pull_requests = body.get("pull_request")
-    if not pull_requests or "patch_url" not in pull_requests:
-        return {"status": "error", "message": "Missing 'pull_requests.patch_url' field"}
-    patch_url = pull_requests["patch_url"]
+async def webhook(req: Request):
+    body = await req.json()
+    pr = body.get("pull_request")
+    if not pr or "patch_url" not in pr:
+        return {"status": "error", "message": "Missing patch_url"}
+    p_url = pr["patch_url"]
     async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
-            response = await client.get(patch_url)
-            response.raise_for_status()
-            patch_content = response.text
+            res = await client.get(p_url)
+            res.raise_for_status()
+            p_text = res.text
         except Exception as e:
             return {"status": "error", "message": str(e)}
-    if listener_queue:
-        pr_info = {
-            "user_login": pull_requests["user"]["login"],
-            "user_id": pull_requests["user"]["id"],
-            "title": pull_requests["title"],
+    if msg_queue:
+        info = {
+            "user_login": pr["user"]["login"],
+            "user_id": pr["user"]["id"],
+            "title": pr["title"],
             "number": body["number"],
             "action": body["action"]
         }
-        lyzr_response = await forward_to_lyzr(patch_content)
-        combined_response = {"pull_request": pr_info, "lyzr_response": lyzr_response}
-        listener_queue.put_nowait(str(combined_response))
-        return {"status": "sent", "message": combined_response}
-    return {"status": "error", "message": "WebSocket listener not ready"}
+        r_text = await send_to_api(p_text)
+        combo = {"pull_request": info, "response": r_text}
+        msg_queue.put_nowait(str(combo))
+        return {"status": "sent", "message": combo}
+    return {"status": "error", "message": "WS not ready"}
 
 @app.get("/", response_class=HTMLResponse)
-async def get_home(request: Request):
-    return templates.TemplateResponse("listener.html", {"request": request})
+async def home(req: Request):
+    return templates.TemplateResponse("listener.html", {"request": req})
 
- 
 @app.head("/")
-async def head_root():
+async def head():
     return Response(status_code=200)
 
-async def main():
-    global listener_queue
-    listener_queue = asyncio.Queue()
+async def run():
+    global msg_queue
+    msg_queue = asyncio.Queue()
 
     config = uvicorn.Config(app, host="0.0.0.0", port=8000, loop="asyncio", lifespan="on")
     server = uvicorn.Server(config)
 
     await asyncio.gather(
-        start_ws_server(),
-        listener_sender(),
+        start_ws(),
+        sender(),
         server.serve()
     )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run())
